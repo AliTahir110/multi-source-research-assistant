@@ -1,10 +1,17 @@
 # app/ui/chainlit_app.py
 from __future__ import annotations
 
+import asyncio
+
 import chainlit as cl
+import httpx
+
 from app.ui.api_client import APIClient
 
 api = APIClient()  # uses API_BASE_URL or defaults to http://127.0.0.1:8001
+
+# Single-flight lock to avoid multiple /session calls on reconnects
+_session_lock = asyncio.Lock()
 
 
 def _format_sources_md(sources: list | None) -> str:
@@ -29,13 +36,19 @@ def _format_sources_md(sources: list | None) -> str:
 
 
 async def _ensure_session() -> str:
-    session_id = cl.user_session.get("session_id")
-    if session_id:
-        return session_id
+    existing = cl.user_session.get("session_id")
+    if existing:
+        return existing
 
-    session_id = await api.create_session()
-    cl.user_session.set("session_id", session_id)
-    return session_id
+    async with _session_lock:
+        # re-check inside lock
+        existing = cl.user_session.get("session_id")
+        if existing:
+            return existing
+
+        session_id = await api.create_session()
+        cl.user_session.set("session_id", session_id)
+        return session_id
 
 
 async def _ask_and_upload_pdf(session_id: str) -> bool:
@@ -77,7 +90,19 @@ async def _ask_and_upload_pdf(session_id: str) -> bool:
 
 @cl.on_chat_start
 async def on_chat_start():
-    session_id = await _ensure_session()
+    try:
+        session_id = await _ensure_session()
+    except httpx.HTTPStatusError as e:
+        if e.response is not None and e.response.status_code == 429:
+            await cl.Message(
+                content="⚠️ Backend is rate-limiting right now (429). Please reload in ~10–20 seconds."
+            ).send()
+            return
+        await cl.Message(content=f"⚠️ Could not create backend session: `{e}`").send()
+        return
+    except Exception as e:
+        await cl.Message(content=f"⚠️ Could not create backend session: `{e}`").send()
+        return
 
     await cl.Message(
         content=(
@@ -125,7 +150,7 @@ async def on_message(message: cl.Message):
                 await cl.Message(content=f"❌ Backend error: `{data}`").send()
                 return
 
-        # ✅ FINAL FALLBACK: if tokens didn't show, render final answer from meta
+        # FINAL FALLBACK: if tokens didn't show, render final answer from meta
         if meta:
             final_answer = None
             renum = meta.get("renumbered_answer")
@@ -136,7 +161,6 @@ async def on_message(message: cl.Message):
             elif isinstance(ans, str) and ans.strip():
                 final_answer = ans.strip()
 
-            # If token streaming produced nothing, update message with final answer
             if final_answer and (not streamed_any_token or not (streamed_msg.content or "").strip()):
                 streamed_msg.content = final_answer
                 await streamed_msg.update()
