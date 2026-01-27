@@ -25,6 +25,17 @@ from app.tools.web_search import tavily_search
 
 app = FastAPI(title="Multi-Source Research Assistant API", version="0.1.0")
 
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # later you can restrict to your Chainlit URL
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
 SESSIONS: Dict[str, Dict[str, str]] = {}
 PERSIST_COLLECTION = "session_docs"
 
