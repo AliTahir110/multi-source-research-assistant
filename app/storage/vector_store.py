@@ -21,3 +21,20 @@ def build_chroma_from_chunks(chunks, persist_dir: str = ".chroma_store"):
         collection_name="docs",
     )
     return vectordb
+
+
+def load_chroma(persist_dir: str = ".chroma_store"):
+    """
+    Loads an existing Chroma vector store from disk.
+    """
+    embeddings = OpenAIEmbeddings(
+        model="text-embedding-3-small",
+        api_key=OPENAI_API_KEY,
+    )
+    
+    vectordb = Chroma(
+        persist_directory=persist_dir,
+        embedding_function=embeddings,
+        collection_name="docs",
+    )
+    return vectordb
