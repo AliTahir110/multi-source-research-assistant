@@ -1,31 +1,55 @@
 # app/ui/api_client.py
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import random
 from typing import Any, AsyncIterator, Optional, Tuple
 
 import httpx
 
 
 class APIClient:
-    """
-    SSE client for FastAPI backend.
-
-    Key stability:
-    - read=None (no streaming read timeout)
-    - robust SSE parsing
-    - DO NOT strip token whitespace (spaces are meaningful)
-    """
-
     def __init__(self, base_url: Optional[str] = None):
         self.base_url = (base_url or os.getenv("API_BASE_URL") or "http://127.0.0.1:8001").rstrip("/")
 
     async def create_session(self) -> str:
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.post(f"{self.base_url}/session")
-            r.raise_for_status()
-            return r.json()["session_id"]
+        """
+        Create backend session with robust 429 handling.
+        - Respects Retry-After header if present
+        - Exponential backoff with jitter
+        """
+        timeout = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=30.0)
+
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            last_exc: Exception | None = None
+
+            for attempt in range(8):
+                try:
+                    r = await client.post(f"{self.base_url}/session")
+
+                    if r.status_code == 429:
+                        retry_after = r.headers.get("Retry-After")
+                        if retry_after and retry_after.isdigit():
+                            wait_s = int(retry_after)
+                        else:
+                            # exp backoff + jitter
+                            wait_s = min(2 ** attempt, 30) + random.uniform(0, 0.8)
+
+                        await asyncio.sleep(wait_s)
+                        continue
+
+                    r.raise_for_status()
+                    data = r.json()
+                    return data["session_id"]
+
+                except Exception as e:
+                    last_exc = e
+                    # small delay for transient network issues
+                    await asyncio.sleep(min(2 ** attempt, 10) + random.uniform(0, 0.5))
+
+            raise RuntimeError(f"Failed to create session after retries. Last error: {last_exc}")
 
     async def upload_pdf(self, session_id: str, file_name: str, file_bytes: bytes) -> dict:
         files = {"file": (file_name, file_bytes, "application/pdf")}
@@ -45,9 +69,8 @@ class APIClient:
 
         timeout = httpx.Timeout(connect=10.0, read=None, write=30.0, pool=None)
         limits = httpx.Limits(max_connections=20, max_keepalive_connections=20, keepalive_expiry=60.0)
-        transport = httpx.AsyncHTTPTransport(retries=0)
 
-        async with httpx.AsyncClient(timeout=timeout, limits=limits, transport=transport) as client:
+        async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
             async with client.stream(
                 "POST",
                 url,
@@ -60,7 +83,6 @@ class APIClient:
                 data_lines: list[str] = []
 
                 async for line in r.aiter_lines():
-                    # end of message
                     if line == "":
                         if event is None and not data_lines:
                             continue
@@ -72,9 +94,7 @@ class APIClient:
                         event = None
 
                         if ev == "token":
-                            # ✅ token is plain text; keep whitespace
                             yield "token", raw
-
                         elif ev in ("meta", "error", "ready", "done"):
                             try:
                                 yield ev, json.loads(raw) if raw.strip() else {}
@@ -82,10 +102,8 @@ class APIClient:
                                 yield ev, raw
                         else:
                             yield ev, raw
-
                         continue
 
-                    # heartbeat
                     if line.startswith(":"):
                         continue
 
@@ -94,7 +112,6 @@ class APIClient:
                         continue
 
                     if line.startswith("data:"):
-                        # ✅ IMPORTANT: only remove ONE optional leading space after "data:"
                         payload = line[len("data:") :]
                         if payload.startswith(" "):
                             payload = payload[1:]
